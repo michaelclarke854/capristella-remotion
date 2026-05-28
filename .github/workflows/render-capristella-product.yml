@@ -1,0 +1,80 @@
+name: Render CapriStella Product Video (Remotion)
+# Triggered per-listing from the Supabase Edge Function
+# `cs-remotion-dispatch` via workflow_dispatch.
+
+on:
+  workflow_dispatch:
+    inputs:
+      listing_id:
+        description: 'Etsy listing_id (matches capristella.product_video_jobs.listing_id)'
+        required: true
+        type: string
+      image_url:
+        description: 'Source product image URL (featured_products.image_url)'
+        required: true
+        type: string
+      product_name:
+        description: 'Product name (for the upload filename only)'
+        required: false
+        type: string
+
+jobs:
+  render:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+
+      - name: Install
+        run: npm ci
+
+      - name: Render MP4
+        run: |
+          npx remotion render ProductReveal \
+            "out/${{ inputs.listing_id }}.mp4" \
+            --props='{"imageUrl":"${{ inputs.image_url }}"}'
+
+      - name: Upload MP4 to Supabase Storage
+        env:
+          SUPABASE_URL: https://bhuprrzltfnthyjvweoc.supabase.co
+          SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+        run: |
+          curl -sS -X POST \
+            "$SUPABASE_URL/storage/v1/object/capristella-media/product-videos/${{ inputs.listing_id }}.mp4" \
+            -H "Authorization: Bearer $SUPABASE_SERVICE_ROLE_KEY" \
+            -H "Content-Type: video/mp4" \
+            -H "x-upsert: true" \
+            --data-binary @"out/${{ inputs.listing_id }}.mp4"
+
+      - name: Mark job completed in DB
+        env:
+          SUPABASE_URL: https://bhuprrzltfnthyjvweoc.supabase.co
+          SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+        run: |
+          PUBLIC_URL="$SUPABASE_URL/storage/v1/object/public/capristella-media/product-videos/${{ inputs.listing_id }}.mp4"
+          curl -sS -X PATCH \
+            "$SUPABASE_URL/rest/v1/product_video_jobs?listing_id=eq.${{ inputs.listing_id }}" \
+            -H "apikey: $SUPABASE_SERVICE_ROLE_KEY" \
+            -H "Authorization: Bearer $SUPABASE_SERVICE_ROLE_KEY" \
+            -H "Content-Profile: capristella" \
+            -H "Content-Type: application/json" \
+            -H "Prefer: return=minimal" \
+            -d "{\"status\":\"completed\",\"output_video_url\":\"$PUBLIC_URL\",\"output_mp4_path\":\"product-videos/${{ inputs.listing_id }}.mp4\",\"completed_at\":\"$(date -u +%Y-%m-%dT%H:%M:%SZ)\"}"
+
+      - name: On failure mark job failed
+        if: failure()
+        env:
+          SUPABASE_URL: https://bhuprrzltfnthyjvweoc.supabase.co
+          SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+        run: |
+          curl -sS -X PATCH \
+            "$SUPABASE_URL/rest/v1/product_video_jobs?listing_id=eq.${{ inputs.listing_id }}" \
+            -H "apikey: $SUPABASE_SERVICE_ROLE_KEY" \
+            -H "Authorization: Bearer $SUPABASE_SERVICE_ROLE_KEY" \
+            -H "Content-Profile: capristella" \
+            -H "Content-Type: application/json" \
+            -d "{\"status\":\"failed\",\"upload_error\":\"github_actions_render_failed\"}"
