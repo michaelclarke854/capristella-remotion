@@ -1,0 +1,8 @@
+node_modules/
+out/
+source-images/
+*.mp4
+*.log
+.DS_Store
+.env
+.env.*

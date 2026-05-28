@@ -1,6 +1,7 @@
 name: Render CapriStella Product Video (Remotion)
-# Triggered per-listing from the Supabase Edge Function
-# `cs-remotion-dispatch` via workflow_dispatch.
+# Triggered per-listing from the Supabase Edge Function `cs-remotion-dispatch`
+# via workflow_dispatch. Renders one 6s 1080x1920 MP4, uploads it to Supabase
+# Storage, and PATCHes the matching capristella.product_video_jobs row.
 
 on:
   workflow_dispatch:
@@ -14,67 +15,98 @@ on:
         required: true
         type: string
       product_name:
-        description: 'Product name (for the upload filename only)'
+        description: 'Product name (for logging only)'
         required: false
         type: string
+
+# Cancel duplicate runs for the same listing_id if user dispatches twice quickly.
+concurrency:
+  group: render-${{ inputs.listing_id }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
 
 jobs:
   render:
     runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    # Pass inputs and secrets as env vars (not shell-interpolation) to neutralise
+    # any shell-metacharacter injection from upstream data.
+    env:
+      LISTING_ID: ${{ inputs.listing_id }}
+      IMAGE_URL: ${{ inputs.image_url }}
+      PRODUCT_NAME: ${{ inputs.product_name }}
+      SUPABASE_URL: https://bhuprrzltfnthyjvweoc.supabase.co
+      SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+      OUT_PATH: out/video.mp4
+
     steps:
       - uses: actions/checkout@v4
 
       - uses: actions/setup-node@v4
         with:
           node-version: 20
-          cache: npm
 
-      - name: Install
-        run: npm ci
+      # Use `npm install` (not `npm ci`) so we don't require a committed lockfile.
+      - name: Install dependencies
+        run: npm install --no-audit --no-fund
 
-      - name: Render MP4
+      - name: Render MP4 with Remotion
         run: |
-          npx remotion render ProductReveal \
-            "out/${{ inputs.listing_id }}.mp4" \
-            --props='{"imageUrl":"${{ inputs.image_url }}"}'
+          mkdir -p out
+          # Build the props JSON in Node — guarantees IMAGE_URL is properly JSON-escaped.
+          PROPS=$(node -e 'process.stdout.write(JSON.stringify({imageUrl: process.env.IMAGE_URL}))')
+          npx remotion render ProductReveal "$OUT_PATH" --props="$PROPS"
+          ls -lh "$OUT_PATH"
 
       - name: Upload MP4 to Supabase Storage
-        env:
-          SUPABASE_URL: https://bhuprrzltfnthyjvweoc.supabase.co
-          SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
         run: |
-          curl -sS -X POST \
-            "$SUPABASE_URL/storage/v1/object/capristella-media/product-videos/${{ inputs.listing_id }}.mp4" \
+          UPLOAD_URL="$SUPABASE_URL/storage/v1/object/capristella-media/product-videos/${LISTING_ID}.mp4"
+          echo "Uploading to $UPLOAD_URL"
+          HTTP_CODE=$(curl -sS -o /tmp/upload-resp.txt -w '%{http_code}' \
+            -X POST "$UPLOAD_URL" \
             -H "Authorization: Bearer $SUPABASE_SERVICE_ROLE_KEY" \
             -H "Content-Type: video/mp4" \
             -H "x-upsert: true" \
-            --data-binary @"out/${{ inputs.listing_id }}.mp4"
+            --data-binary "@$OUT_PATH")
+          echo "HTTP $HTTP_CODE"
+          cat /tmp/upload-resp.txt
+          test "$HTTP_CODE" -ge 200 -a "$HTTP_CODE" -lt 300
 
       - name: Mark job completed in DB
-        env:
-          SUPABASE_URL: https://bhuprrzltfnthyjvweoc.supabase.co
-          SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
         run: |
-          PUBLIC_URL="$SUPABASE_URL/storage/v1/object/public/capristella-media/product-videos/${{ inputs.listing_id }}.mp4"
+          export PUBLIC_URL="$SUPABASE_URL/storage/v1/object/public/capristella-media/product-videos/${LISTING_ID}.mp4"
+          BODY=$(node -e 'process.stdout.write(JSON.stringify({
+            status: "completed",
+            output_video_url: process.env.PUBLIC_URL,
+            output_mp4_path: "product-videos/" + process.env.LISTING_ID + ".mp4",
+            completed_at: new Date().toISOString()
+          }))')
           curl -sS -X PATCH \
-            "$SUPABASE_URL/rest/v1/product_video_jobs?listing_id=eq.${{ inputs.listing_id }}" \
+            "$SUPABASE_URL/rest/v1/product_video_jobs?listing_id=eq.${LISTING_ID}" \
             -H "apikey: $SUPABASE_SERVICE_ROLE_KEY" \
             -H "Authorization: Bearer $SUPABASE_SERVICE_ROLE_KEY" \
             -H "Content-Profile: capristella" \
             -H "Content-Type: application/json" \
             -H "Prefer: return=minimal" \
-            -d "{\"status\":\"completed\",\"output_video_url\":\"$PUBLIC_URL\",\"output_mp4_path\":\"product-videos/${{ inputs.listing_id }}.mp4\",\"completed_at\":\"$(date -u +%Y-%m-%dT%H:%M:%SZ)\"}"
+            -d "$BODY"
+          echo "DB row marked completed for listing $LISTING_ID"
 
       - name: On failure mark job failed
         if: failure()
-        env:
-          SUPABASE_URL: https://bhuprrzltfnthyjvweoc.supabase.co
-          SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
         run: |
+          STAGE="${{ job.status }}"
+          BODY=$(node -e 'process.stdout.write(JSON.stringify({
+            status: "failed",
+            upload_error: "github_actions_render_failed: " + (process.env.GITHUB_RUN_ID || "unknown")
+          }))')
           curl -sS -X PATCH \
-            "$SUPABASE_URL/rest/v1/product_video_jobs?listing_id=eq.${{ inputs.listing_id }}" \
+            "$SUPABASE_URL/rest/v1/product_video_jobs?listing_id=eq.${LISTING_ID}" \
             -H "apikey: $SUPABASE_SERVICE_ROLE_KEY" \
             -H "Authorization: Bearer $SUPABASE_SERVICE_ROLE_KEY" \
             -H "Content-Profile: capristella" \
             -H "Content-Type: application/json" \
-            -d "{\"status\":\"failed\",\"upload_error\":\"github_actions_render_failed\"}"
+            -H "Prefer: return=minimal" \
+            -d "$BODY"
